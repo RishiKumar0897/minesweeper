@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Minesweeper</title>
+    <!--
+        STEP 4 (styles): how each cell state looks.
+        The JS never sets colors directly - it only adds/removes classes
+        (cell, revealed, mine) and the CSS decides the look.
+    -->
+    <style>
+        /* Base cell = a hidden (unrevealed) square: fixed 30x30, raised gray. */
+        .cell {
+            width: 30px;
+            height: 30px;
+            border: 1px solid #000;
+            text-align: center;
+            line-height: 30px;      /* vertically centers the number/emoji */
+            font-size: 20px;
+            cursor: pointer;
+            user-select: none;      /* stops text highlighting on fast clicks */
+            background-color: #bbb;
+        }
+        /* Each row is a flex container so its cells sit side by side.
+           (Alternative: one CSS Grid on #game-board with repeat(cols, 30px).) */
+        .row {
+            display: flex;
+        }
+        /* Revealed cells are flat and lighter than hidden ones. */
+        .cell.revealed {
+            background-color: #eee;
+        }
+        /* Revealed mines (shown when the player loses). */
+        .cell.mine {
+            background-color: red;
+        }
+    </style>
+</head>
+<body>
+    <h1>Minesweeper</h1>
+    <p>Right-click to flag a cell. Left-click to reveal a cell.</p>
+
+    <!-- The grid container. render() fills it with .row divs of .cell divs. -->
+    <div id="game-board">
+        <!-- Game board will be generated here -->
+    </div>
+
+    <!-- Win/lose message. Used instead of alert(), which would block the page
+         before the final board is drawn. -->
+    <p id = "status">
+        Game in progress
+    </p>
+
+    <!-- TODO: location.reload() works but skips newGame(). In the interview, wire this
+         button to newGame() with addEventListener to show proper state reset. -->
+    <button onclick="location.reload()">Restart Game</button>
+
+    <!-- Mine counter = total mines - flags placed. Updated at the end of render(). -->
+    <span id="mines-count">Mines: 10</span>
+
+<script>
+    /*
+     * MINESWEEPER
+     * A grid of hidden cells, some of which are mines. Left-click reveals a cell:
+     * a mine loses; otherwise it shows how many of its 8 neighbors are mines, and
+     * a 0 automatically opens its neighbors (flood fill). Right-click toggles a flag.
+     * You win when every non-mine cell is revealed.
+     *
+     * Core idea: all game state lives in JS (gameBoard + a few variables).
+     * The DOM is only a picture of that state, rebuilt by render().
+     *
+     * BUILD ORDER (how this file was implemented):
+     *   1. Data model     - state variables + createBoard()
+     *   2. Place mines    - placeMines()
+     *   3. Count mines    - getNeighbors() + calculateAdjacent()
+     *   4. Draw the board - CSS + render()
+     *   5. Input          - delegated click listeners + flagCell()
+     *   6. Core logic     - revealCell(): lose / flood fill / win
+     *   7. Extras         - newGame(), safe first click, mine counter
+     *                       (TODO: timer, difficulty levels, chording)
+     */
+
+    // ===== STEP 1: DATA MODEL - game-level state =====
+    let gameOver = false;       // true after a win or loss; blocks further input
+    let revealedCount = 0;      // number of safe cells revealed; used for the win check
+    const rows = 10;
+    const cols = 10;
+    const mines = 10;
+    let gameBoard = [];         // 2D array [row][col] of cell objects (see createBoard)
+    let firstClick = true;      // STEP 7: mines are placed on the first click so it's always safe
+
+    // ===== STEP 5: INPUT - event delegation =====
+    // One listener on the board instead of one per cell. Added ONCE here (not in
+    // render()), because render() only replaces the board's children - adding
+    // listeners there would stack duplicates and fire several times per click.
+    // Calling the handlers before they're defined below works because function
+    // declarations are hoisted.
+    const boardElement = document.getElementById('game-board');
+    boardElement.addEventListener('click', handleCellClick);
+    boardElement.addEventListener('contextmenu', handleCellRightClick);
+
+    // ===== STEP 1: DATA MODEL - the board =====
+    // Builds a fresh rows x cols grid where every cell starts hidden, unflagged,
+    // mine-free, with 0 adjacent mines. Each cell is a NEW object - using
+    // Array.fill({...}) would share one object across every cell (classic bug).
+    function createBoard() {
+        gameBoard = [];         // reset so no leftover rows survive a new game
+        for (let i = 0; i < rows; i++) {
+            gameBoard[i] = [];
+            for (let j = 0; j < cols; j++) {
+                gameBoard[i][j] = {
+                    isMine: false,
+                    isRevealed: false,
+                    adjacentMines: 0,
+                    isFlagged: false
+                };
+            }
+        }
+    }
+
+    // ===== STEP 2: PLACE MINES =====
+    // Randomly places exactly `mines` mines, never on (safeRow, safeCol) - the
+    // cell from the first click (STEP 7).
+    // Uses a retry loop: pick a random cell, skip it if it's already a mine.
+    // A plain for-loop of 10 picks could hit the same cell twice and place only 9.
+    // Alternative worth mentioning: shuffle all positions and take the first N.
+    function placeMines(safeRow = -1, safeCol = -1) {
+        let minesPlaced = 0;
+        // Guard: without this, too many mines would make the while loop run forever.
+        if (mines > rows * cols) {
+            console.error("Number of mines exceeds the number of cells.");
+            return;
+        }
+        while (minesPlaced < mines) {
+            const row = Math.floor(Math.random() * rows);   // 0 .. rows-1
+            const col = Math.floor(Math.random() * cols);   // 0 .. cols-1
+            if (!gameBoard[row][col].isMine && !(row === safeRow && col === safeCol)) {
+                gameBoard[row][col].isMine = true;
+                minesPlaced++;
+            }
+        }
+    }
+
+    // ===== STEP 3: COUNT NEIGHBORING MINES =====
+    // Returns the in-bounds neighbors of (row, col) as [{row, col}, ...].
+    // Corner = 3, edge = 5, middle = 8. Reused by calculateAdjacent() and the flood fill.
+    function getNeighbors(row, col) {
+        const neighbors = [];
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                if (dr === 0 && dc === 0) continue;     // skip the cell itself
+                const r = row + dr;
+                const c = col + dc;
+                // Bounds-check the REAL position (r, c), not the offset (dr, dc).
+                if (r < 0 || r >= rows || c < 0 || c >= cols) continue;
+                neighbors.push({ row: r, col: c });
+            }
+        }
+        return neighbors;
+    }
+
+    // Sets adjacentMines on every non-mine cell. Must run AFTER placeMines().
+    function calculateAdjacent() {
+        for (let i = 0; i < rows; i++) {
+            for (let j = 0; j < cols; j++) {
+                if (gameBoard[i][j].isMine) continue;   // a mine's own count is never shown
+                const neighbors = getNeighbors(i, j);
+                let count = 0;
+                for (const neighbor of neighbors) {
+                    if (gameBoard[neighbor.row][neighbor.col].isMine) {
+                        count++;
+                    }
+                }
+                gameBoard[i][j].adjacentMines = count;
+            }
+        }
+    }
+
+    // ===== STEP 4: DRAW THE BOARD =====
+    // Rebuilds the whole grid from gameBoard. render() only READS state - it never
+    // changes it (game rules live in revealCell/flagCell). Rebuilding 100 cells is
+    // cheap; for big boards you'd create elements once and update only changed cells.
+    function render() {
+        boardElement.innerHTML = '';
+        for (let i = 0; i < rows; i++) {
+            const rowElement = document.createElement('div');
+            rowElement.classList.add('row');
+            for (let j = 0; j < cols; j++) {
+                const cell = gameBoard[i][j];
+                const cellElement = document.createElement('div');
+                cellElement.classList.add('cell');
+                // Store the position on the element so the click handler knows
+                // which cell was clicked (STEP 5).
+                cellElement.dataset.row = i;
+                cellElement.dataset.col = j;
+                if (cell.isRevealed) {
+                    cellElement.classList.add('revealed');
+                    if (cell.isMine) {
+                        cellElement.textContent = '💣';
+                        cellElement.classList.add('mine');
+                    } else {
+                        // Show the count; a 0 is shown as an empty revealed cell.
+                        cellElement.textContent = cell.adjacentMines > 0 ? cell.adjacentMines : '';
+                    }
+                }
+                else if (cell.isFlagged) {
+                    cellElement.textContent = '🚩';
+                }
+                rowElement.appendChild(cellElement);
+            }
+            boardElement.appendChild(rowElement);
+        }
+
+        // STEP 7: mine counter. Derived from the board instead of kept in a separate
+        // variable, so it can never drift out of sync with the actual flags.
+        const flagCount = gameBoard.flat().filter(c => c.isFlagged).length;
+        document.getElementById('mines-count').textContent = 'Mines: ' + (mines - flagCount);
+    }
+
+    // ===== STEP 5: INPUT HANDLERS =====
+    // Handlers only translate a click into (row, col); game rules live in
+    // revealCell/flagCell.
+
+    // Left-click -> reveal.
+    function handleCellClick(event) {
+        if (gameOver) return;
+        // closest() finds the .cell even if the click landed on something inside it,
+        // and returns null for clicks on the board/row background (e.g. right of the grid).
+        const cellEl = event.target.closest('.cell');
+        if (!cellEl) return;
+        // dataset values are STRINGS - convert, or row + dr becomes "5" + -1 = "5-1".
+        const row = parseInt(cellEl.dataset.row);
+        const col = parseInt(cellEl.dataset.col);
+        revealCell(row, col);
+    }
+
+    // Right-click -> toggle flag.
+    function handleCellRightClick(event) {
+        event.preventDefault();     // first, so the browser menu never appears (even after game over)
+        if (gameOver) return;
+        const cellEl = event.target.closest('.cell');
+        if (!cellEl) return;
+        const row = parseInt(cellEl.dataset.row);
+        const col = parseInt(cellEl.dataset.col);
+        flagCell(row, col);
+    }
+
+    // Toggles the flag on a hidden cell. Revealed cells can't be flagged.
+    function flagCell(row, col) {
+        if (gameBoard[row][col].isRevealed) return;
+        if (gameBoard[row][col].isFlagged) {
+            gameBoard[row][col].isFlagged = false;
+        } else {
+            gameBoard[row][col].isFlagged = true;
+        }
+        render();
+    }
+
+    // ===== STEP 6: CORE LOGIC - reveal a cell =====
+    // Order: guards -> mine (lose) -> first click setup -> flood fill -> win check -> render.
+    function revealCell(row, col) {
+        const cell = gameBoard[row][col];
+        // Guards: ignore clicks after the game ends, on revealed cells, or on flags.
+        if (gameOver || cell.isRevealed || cell.isFlagged) return;
+
+        // Hit a mine -> lose. Reveal only the mines (flags elsewhere stay visible),
+        // draw, and stop. On the very first click there are no mines yet, so this
+        // can't trigger before placeMines() runs below.
+        if (cell.isMine) {
+            gameOver = true;
+            document.getElementById('status').textContent = "Game Over! You hit a mine.";
+            for (let i = 0; i < rows; i++) {
+                for (let j = 0; j < cols; j++) {
+                    if (gameBoard[i][j].isMine) {
+                        gameBoard[i][j].isRevealed = true;
+                    }
+                }
+            }
+            render();
+            return;
+        }
+
+        // STEP 7: safe first click - place mines now, avoiding the clicked cell,
+        // then compute the numbers for the new layout.
+        if (firstClick) {
+            firstClick = false;
+            placeMines(row, col);
+            calculateAdjacent();
+        }
+
+        // Flood fill with a stack (iterative DFS) - avoids recursion-depth limits
+        // on big boards. Cells are revealed when POPPED, so every cell (including
+        // the clicked one) goes through the same checks:
+        //   - skip if already revealed or flagged (also stops two 0s re-adding
+        //     each other forever, and keeps revealedCount exact)
+        //   - reveal + count it
+        //   - only a 0 spreads to its neighbors. A 0 has no mine neighbors, so the
+        //     fill can never reach a mine. Numbers form the border of the area.
+        const stack = [{row, col}];
+        while (stack.length > 0) {
+            const {row: r, col: c} = stack.pop();
+            const curr = gameBoard[r][c];
+            if (curr.isRevealed || curr.isFlagged) continue;
+            curr.isRevealed = true;
+            revealedCount++;
+            if (curr.adjacentMines === 0) {
+                const neighbors = getNeighbors(r, c);
+                for (const neighbor of neighbors) {
+                    const neighborCell = gameBoard[neighbor.row][neighbor.col];
+                    // Pre-filter to keep the stack small. The check after pop is
+                    // still needed: a cell can be pushed by two neighbors.
+                    if (!neighborCell.isRevealed && !neighborCell.isFlagged) {
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        // Win: every non-mine cell is revealed (flags aren't required).
+        if (revealedCount === rows * cols - mines) {
+            gameOver = true;
+            document.getElementById('status').textContent = "Congratulations! You've cleared the board.";
+        }
+        render();       // draw once at the end, not inside the loop
+    }
+
+    // ===== STEP 7: NEW GAME / RESET =====
+    // Resets ALL state (forgetting one, e.g. revealedCount, causes early wins next game).
+    // Mines are NOT placed here - that happens on the first click (safe first click).
+    // TODO (timer): reset seconds, clearInterval(timerId) here, start it on first click,
+    // and clear it on win/loss - otherwise each reset stacks another interval.
+    function newGame() {
+        gameOver = false;
+        revealedCount = 0;
+        firstClick = true;
+        createBoard();
+        render();
+        document.getElementById('status').textContent = "Game in progress";
+    }
+
+    // Start the first game on page load.
+    newGame();
+
+</script>
+</body>
+</html>
